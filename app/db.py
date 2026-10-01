@@ -70,7 +70,23 @@ CREATE TABLE IF NOT EXISTS transfer_batch_item (
     item_index   INTEGER NOT NULL                       -- 提交顺序（0 起）
 );
 
+-- 样本保管链版本（质控复核用）：版本 0 为登记/升级基线快照，此后每次真正提交
+-- （单事件、批量移交中该样本事件、作废/替换纠错、入库核定）追加一个不可变快照行。
+-- 版本按提交先后（id/created_at）排列，补录事件的较早发生时间不改写旧版。
+CREATE TABLE IF NOT EXISTS sample_version (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id     INTEGER NOT NULL REFERENCES sample(id),
+    version       INTEGER NOT NULL,                     -- 样本内版本号，从 0 起严格递增
+    change_type   TEXT NOT NULL CHECK (change_type IN
+                    ('register','event','batch_transfer','correction','approval','baseline')),
+    change_ref    TEXT,                                 -- 触发版本的业务号（事件号/批次号/纠错号；register/baseline 为 NULL）
+    snapshot_json TEXT NOT NULL,                        -- 提交时点完整核验快照（结论/原因/保管人/时间线/纠错/核定）
+    created_at    TEXT NOT NULL,
+    UNIQUE (sample_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
@@ -139,6 +155,12 @@ def init_db() -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         for stmt in POST_MIGRATION_INDEXES:
             conn.execute(stmt)
+    # 升级前已有样本：以升级时状态补建版本 0 基线（不推断更早历史）。
+    # 惰性导入避免 db ↔ service 的模块级循环依赖。
+    from .versions import ensure_version_baselines
+
+    with db_session(immediate=True) as conn:
+        ensure_version_baselines(conn)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

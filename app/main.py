@@ -22,6 +22,7 @@ from .service import (
     submit_correction,
     submit_transfer_batch,
 )
+from .versions import get_version, latest_version_no, list_versions, parse_version
 
 API_PREFIX = "/api/v1"
 
@@ -42,8 +43,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="样本交接链核验服务",
-    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验与入库核定",
-    version="1.2.0",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定与版本化复核",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -53,8 +54,12 @@ async def domain_error_handler(request: Request, exc: DomainError) -> JSONRespon
     return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}})
 
 
-def _summary(result: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
-    return evaluation_summary(result, sample)
+def _summary(result: dict[str, Any], sample: dict[str, Any], conn=None) -> dict[str, Any]:
+    body = evaluation_summary(result, sample)
+    if conn is not None:
+        # 当前最新版本号（版本 0 起；便于质控复核定位）
+        body["current_version"] = latest_version_no(conn, sample["id"])
+    return body
 
 
 # --------------------------------------------------------------------------- 基本信息
@@ -84,7 +89,7 @@ def register_sample_api(data: SampleIn) -> JSONResponse:
         result = evaluate(conn, sample)
         body = {
             "sample": {k: sample[k] for k in ("sample_code", "collected_at", "collector", "seal_no", "created_at")},
-            "evaluation": _summary(result, dict(sample)),
+            "evaluation": _summary(result, dict(sample), conn),
             "idempotent": idempotent,
         }
     return JSONResponse(status_code=200 if idempotent else 201, content=body)
@@ -94,7 +99,7 @@ def register_sample_api(data: SampleIn) -> JSONResponse:
 def list_samples_api() -> dict[str, Any]:
     with db_session() as conn:
         samples = conn.execute("SELECT * FROM sample ORDER BY id").fetchall()
-        items = [_summary(evaluate(conn, s), dict(s)) for s in samples]
+        items = [_summary(evaluate(conn, s), dict(s), conn) for s in samples]
     return {"total": len(items), "items": items}
 
 
@@ -103,7 +108,7 @@ def get_sample_api(sample_code: str) -> dict[str, Any]:
     with db_session() as conn:
         sample = get_sample_or_404(conn, sample_code)
         result = evaluate(conn, sample)
-        return {"sample": row_to_dict(sample), "evaluation": _summary(result, dict(sample))}
+        return {"sample": row_to_dict(sample), "evaluation": _summary(result, dict(sample), conn)}
 
 
 @app.get(f"{API_PREFIX}/samples/{{sample_code}}/chain", tags=["samples"])
@@ -123,7 +128,41 @@ def get_chain_api(sample_code: str) -> dict[str, Any]:
             "timeline": result["timeline"],
             "corrections": result["corrections"],
             "superseded_events": result["superseded_events"],
+            "current_version": latest_version_no(conn, sample["id"]),
         }
+
+
+# --------------------------------------------------------------------------- 保管链版本复核
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions", tags=["versions"])
+def list_versions_api(sample_code: str) -> dict[str, Any]:
+    """版本索引：列出该样本全部版本（版本号、提交时间、触发类型、当时结论）。
+
+    版本按提交先后排列；核定后旧版仍可查询。
+    """
+    with db_session() as conn:
+        return list_versions(conn, sample_code)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions/latest", tags=["versions"])
+def get_latest_version_api(sample_code: str) -> dict[str, Any]:
+    """当前最新版本的完整保管链快照（便捷端点，等价于按 current_version 取版本）。"""
+    with db_session() as conn:
+        sample = get_sample_or_404(conn, sample_code)
+        version = latest_version_no(conn, sample["id"])
+        return {"version_snapshot": get_version(conn, sample_code, version)}
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions/{{version_raw}}", tags=["versions"])
+def get_version_api(sample_code: str, version_raw: str) -> dict[str, Any]:
+    """指定版本复核：返回该版本提交时点的核验结论、原因、当前保管人、
+    有效事件时间线、纠错记录与核定信息（不可变快照）。
+
+    未知样本 → 404 sample_not_found；不存在的版本 → 404 version_not_found。
+    """
+    version = parse_version(version_raw)
+    with db_session() as conn:
+        return {"version_snapshot": get_version(conn, sample_code, version)}
 
 
 # --------------------------------------------------------------------------- 事件上报
@@ -147,7 +186,7 @@ def create_event_api(data: EventIn) -> JSONResponse:
                 "payload": json.loads(row["payload_json"]),
                 "recorded_at": row["created_at"],
             },
-            "evaluation": _summary(result, dict(sample)),
+            "evaluation": _summary(result, dict(sample), conn),
             "idempotent": idempotent,
         }
     return JSONResponse(status_code=200 if idempotent else 201, content=body)
@@ -209,4 +248,4 @@ def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
     with db_session(immediate=True) as conn:
         result = approve_storage(conn, sample_code, data)
         sample = get_sample_or_404(conn, sample_code)
-        return {"evaluation": _summary(result, dict(sample)), "approval": result["approval"]}
+        return {"evaluation": _summary(result, dict(sample), conn), "approval": result["approval"]}

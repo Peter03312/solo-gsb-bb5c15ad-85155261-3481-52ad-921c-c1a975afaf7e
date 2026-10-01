@@ -1,6 +1,6 @@
 # 样本交接链核验服务（Chain of Custody）
 
-面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；同一交接车次的多份样本支持**批量移交一次提交**（全局唯一批次号、统一移交时间/交出人/接收人，整批原子、同号幂等）；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结。
+面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；同一交接车次的多份样本支持**批量移交一次提交**（全局唯一批次号、统一移交时间/交出人/接收人，整批原子、同号幂等）；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结；全部真正提交按先后形成**不可变版本**，质控可按样本编号 + 版本号复核任一历史版本的结论、原因、保管人、有效时间线、纠错与核定信息（版本 0 起，核定后旧版仍可查）。
 
 技术栈：**Python 3.11 + FastAPI + SQLite（标准库 sqlite3）**，无外部服务依赖。
 
@@ -26,6 +26,7 @@
 | 核定前纠错 | 核定前可按样本编号 + 当前有效事件号提交**作废（void）/替换（replace）**，附全局唯一纠错号、操作人、原因；替换须给完整新事件内容与**未占用**的新事件号。原事件与纠错关系永久留痕，核验仅纳入有效版本并按发生时间重算结论/原因/当前保管人；被替换记录可经链查询追溯。纠错**不得跨样本**；同纠错号同内容重试幂等（200）、异内容冲突（409）；并发针对同一有效版本仅一次成功，失败不改链。核定入库后拒绝纠错 |
 | 纠错与核定并发 | 写事务以 `BEGIN IMMEDIATE` 串行：先提交者生效，后到者看到其已提交结果——作废先提交则核定基于最终有效链（非 valid 则 422），核定先提交则纠错被 `history_locked` 拒绝 |
 | 入库核定 | 仅 `valid` 可核定；核定后该样本登记与事件全部**拒绝改写**（HTTP 409），重复核定幂等 |
+| 版本化复核 | 样本保管链按**提交先后**形成不可变版本：新登记样本从**版本 0**开始；升级前已有样本以**升级时状态**补建版本 0 基线，不推断更早历史。此后每次**真正提交**——单事件、批量移交中的该样本事件、作废/替换纠错、入库核定——各使受影响样本版本**递增一次**；同号同内容重试与失败操作**不产生版本**。补录事件的发生时间较早也**不改写旧版**；同批次各样本的版本与事件**一同提交或一同失败**。核定后旧版仍可查询 |
 
 > 说明：任何事件发生时间早于样本采集时间，直接记为无效（采集前不可能发生保管动作）。
 
@@ -367,6 +368,102 @@ curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
 
 被作废/替换的批内原事件同样出现在对应样本 chain 的 `timeline.batch_id`（有效时）或 `superseded_events.batch_id`（失效后），可双向追溯。
 
+### 5.7 保管链版本复核（质控）
+
+质控人员按**样本编号 + 版本号**复核某份样本在指定提交版本的保管链：当时的核验结论、原因、当前保管人、有效事件时间线、纠错记录、被作废/替换留痕与核定信息；并可随时取得当前最新版本号。版本快照在提交时点固化、不可变，核定后的旧版仍可查询。
+
+版本号规则：
+
+- **版本 0**：新登记样本的登记基线；升级前已有样本在启动迁移时以**升级时状态**补建一条 `baseline` 版本 0（不推断更早历史）。
+- **每次真正提交 +1**：单事件上报、批量移交中该样本的那份事件、作废/替换纠错成功、入库核定成功，各使受影响样本递增一个版本。
+- **不产生版本**：同号同内容的幂等重试（样本/事件/批次/纠错/核定）、以及任何失败操作（冲突 409、整批失败、核定被拒 422、字段校验 422 等）。
+- **按提交先后**：版本顺序是写入提交顺序，与事件 `occurred_at` 无关——乱序补录的更早事件只进入新版本，**旧版快照不变**。
+- **批次原子**：同一批次各样本的版本与其事件在同一事务中，整批成功则每份 +1，整批失败则一份都不增。
+
+#### 版本索引
+
+`GET /api/v1/samples/{sample_code}/versions`
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/versions
+```
+
+```json
+{
+  "sample_code": "S-001",
+  "current_version": 6,
+  "total": 7,
+  "items": [
+    {"version": 0, "change_type": "register", "change_ref": null,
+     "committed_at": "2026-09-30T01:05:00Z", "status": "pending",
+     "reasons": ["缺少实验室入库记录"], "current_custodian": "王采集",
+     "has_storage": false, "event_count": 0, "approved_storage_at": null},
+    {"version": 1, "change_type": "event", "change_ref": "EVT-T1", "...": "..."},
+    {"version": 5, "change_type": "correction", "change_ref": "FIX-0002", "...": "..."},
+    {"version": 6, "change_type": "approval", "change_ref": null,
+     "committed_at": "2026-09-30T05:20:00Z", "status": "valid",
+     "current_custodian": "实验室", "approved_storage_at": "2026-09-30T05:20:00Z"}
+  ]
+}
+```
+
+`items[].change_type` 取值：`register`（登记版本 0）/ `baseline`（升级基线版本 0）/ `event`（单事件）/ `batch_transfer`（批量移交中的该样本事件，`change_ref` 为批次号）/ `correction`（作废或替换纠错，`change_ref` 为纠错号）/ `approval`（入库核定）。
+
+#### 指定版本完整快照
+
+`GET /api/v1/samples/{sample_code}/versions/{version}`
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/versions/3
+```
+
+返回该版本**提交时点固化**的完整快照（结构与 5.3 的 `chain` 同源）：
+
+```json
+{
+  "version_snapshot": {
+    "sample": {"sample_code": "S-001", "collector": "王采集", "seal_no": "SEAL-001", "...": "..."},
+    "version": 3,
+    "change_type": "event",
+    "change_ref": "EVT-R1",
+    "committed_at": "2026-09-30T04:00:03Z",
+    "status": "pending",
+    "reasons": ["缺少实验室入库记录"],
+    "current_custodian": "李运输",
+    "pending_transfer": null,
+    "has_storage": false,
+    "event_count": 2,
+    "timeline": [ {"event_id": "EVT-T1", "...": "..."}, {"event_id": "EVT-R1", "...": "..."} ],
+    "corrections": [],
+    "superseded_events": [],
+    "approved_storage_at": null,
+    "approved_by": null,
+    "approval": null
+  }
+}
+```
+
+- `timeline` 为当时的**有效事件**时间线；`corrections` / `superseded_events` 为截至该版本的纠错与作废/替换留痕；
+- `approval` 在核定版本及之后为 `{approved_at, approver, note}`，此前为 `null`；
+- 快照一经写入不再随后续纠错/补录变化——对比不同版本即可复核保管链如何演变。
+
+#### 当前最新版本
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/versions/latest
+```
+
+等价于先查索引取 `current_version` 再按号取快照。此外，样本列表/单样本摘要/证据链/事件与纠错写入响应/批次逐项 `evaluation` 中均附 `current_version` 字段（增量字段，不影响既有响应）。
+
+#### 错误
+
+| 情形 | HTTP | code |
+|---|---|---|
+| 样本编号未知（索引 / latest / 指定版本均是） | 404 | `sample_not_found` |
+| 版本号不存在（含非整数、负数；详情带 `current_version` 便于定位） | 404 | `version_not_found` |
+
+核定（冻结）只阻止新的写入，**不影响任何版本的只读查询**。
+
 ### 错误响应统一格式
 
 ```json
@@ -376,6 +473,7 @@ curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
 | HTTP | code | 触发 |
 |---|---|---|
 | 404 | `sample_not_found` / `event_not_found` | 样本不存在 / 纠错目标事件不存在 |
+| 404 | `version_not_found` | 版本复核的版本号不存在（非整数/负数/超出现有版本；详情附 `current_version`） |
 | 409 | `sample_conflict` / `event_conflict` | 同编号异内容 / 同事件号异内容 |
 | 409 | `history_locked` | 已核定入库后改写历史或纠错 |
 | 409 | `correction_conflict` | 同纠错号异内容（含动作 void↔replace 不一致） |
@@ -397,7 +495,15 @@ curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+
+版本复核也可用 curl 直接体验（完整脚本见下）：
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/versions            # 版本索引 + current_version
+curl http://localhost:8080/api/v1/samples/S-001/versions/3          # 指定版本完整快照
+curl http://localhost:8080/api/v1/samples/S-001/versions/latest     # 当前最新版本快照
+```
 
 ---
 
@@ -406,12 +512,14 @@ python examples/call_api.py
 ```bash
 python -m tests.test_chain          # 既有规则：42 项断言
 python -m tests.test_corrections    # 纠错：65 项断言（含并发）
-python -m tests.test_batches        # 本轮批量移交：83 项断言（含并发）
+python -m tests.test_batches        # 批量移交：83 项断言（含并发）
+python -m tests.test_versions       # 版本复核：94 项断言（含旧库迁移基线）
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
 - `test_corrections` 覆盖：作废后仅有效版本重算（结论/原因/保管人）、替换生效与多跳替换、原事件与纠错关系留痕及链追溯、审计查询、同纠错号幂等/异内容冲突、跨样本拒绝、非有效版本拒绝、新事件号占用、replace/void 载荷校验、核定后拒绝纠错、同事件号 200/409 兼容、同有效版本并发仅一次成功、纠错与核定并发两种合法结局（可重复运行）。
 - `test_batches` 覆盖：整批提交各份成为既有 transfer（逐份 pending/invalid 与在途信息、时间线批次归属）、整批失败四类原因（批内样本/事件号重复、样本不存在、已核定、事件号占用）且不留批次/事件/明细、冲突聚合与 409/422 优先、同批次号幂等（items 换序、时区归一、核定后仍 200）与异内容 409、批次查询随作废/替换更新（`event_effective`/`current_event_id`）与原始归属留痕、单事件接口对批量事件号 200/409、同批并发一建一幂等、异批事件号交叠一胜整批回滚、批次与核定并发按已提交顺序判定两种结局、载荷校验与失败批次号复用。
+- `test_versions` 覆盖：登记即版本 0（快照字段）、单事件每次真正提交 +1 而同号重试/冲突失败不产生版本、快照不可变且补录较早事件不改旧版（版本按提交先后、时间线按发生时间重排）、批量移交各样本版本随事件同提交/整批失败全不增/幂等不增/失败批次号修正后复用、替换与作废纠错 +1 而幂等与对失效事件纠错不增、核定 +1 而核定被拒/重复核定/冻结后写入不增、核定后全部旧版仍可查、版本索引/`latest`/指定版本端点、未知样本与不存在/非数字/负数版本号报错、快照完整字段、旧库迁移为已有样本补建 `baseline` 版本 0 且幂等、迁移后版本从 1 继续。
 
 ---
 
@@ -422,14 +530,16 @@ python -m tests.test_batches        # 本轮批量移交：83 项断言（含并
 ├── app/
 │   ├── main.py       # FastAPI 路由、异常映射、启动初始化
 │   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结、批量移交
+│   ├── versions.py   # 保管链版本：版本快照记录、版本 0 基线迁移、版本索引/指定版本查询
 │   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）按类型必填校验
-│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表）、IMMEDIATE 事务
+│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表、版本表与基线补建）、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等）
 │   └── config.py     # 环境变量配置
-├── examples/call_api.py   # 零依赖调用示例（含纠错与批量移交全流程）
+├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交与版本复核全流程）
 ├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
 ├── tests/test_corrections.py  # 纠错端到端自测（65 项断言，含并发）
 ├── tests/test_batches.py  # 批量移交端到端自测（83 项断言，含并发）
+├── tests/test_versions.py # 保管链版本复核实端到端自测（94 项断言，含旧库迁移）
 ├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml

@@ -282,6 +282,36 @@ def main() -> None:
         print(f"    {it['sample_code']}: 原事件 {it['event_id']} 有效={it['event_effective']}"
               f" 当前有效事件={it['current_event_id']} 结论={it['evaluation']['status']}")
 
+    # 13) 保管链版本复核（质控）：按样本编号 + 版本号查询当时的结论、原因、保管人与时间线
+    print("\n=== 保管链版本复核 ===")
+    s, r = call("GET", f"/samples/{code}/versions")
+    print(f"--- 版本索引 [HTTP {s}] 当前最新版本: {r['current_version']}（共 {r['total']} 版）---")
+    for it in r["items"]:
+        print(f"    v{it['version']} [{it['change_type']}] {it['committed_at']}"
+              f" 结论={it['status']} 保管人={it['current_custodian']} 触发号={it['change_ref']}")
+
+    # 指定历史版本：复核核定（入库）当时的完整快照
+    s, r = call("GET", f"/samples/{code}/versions/0")
+    v0 = r["version_snapshot"]
+    print(f"\n--- 版本 0（登记基线）[HTTP {s}] ---")
+    print("结论:", v0["status"], "| 时间线事件数:", len(v0["timeline"]), "| 核定:", v0["approval"])
+
+    # latest 便捷端点
+    s, r = call("GET", f"/samples/{code}/versions/latest")
+    latest = r["version_snapshot"]
+    print(f"--- 当前最新版本 [HTTP {s}] v{latest['version']} [{latest['change_type']}] ---")
+    print("结论:", latest["status"], "| 保管人:", latest["current_custodian"], "| 核定信息:", latest["approval"])
+    print("当时有效时间线:", [(e["event_type"], e["event_id"]) for e in latest["timeline"]])
+    print("纠错留痕:", [(c["correction_id"], c["action"]) for c in latest["corrections"]])
+    print("作废/替换留痕:", [(e["event_id"], e["superseded_by"]) for e in latest["superseded_events"]])
+
+    # 未知样本 / 不存在的版本明确报错
+    s, r = call("GET", "/samples/NO-SUCH-SAMPLE/versions/0")
+    print("\n未知样本查询:", s, r.get("error", {}).get("code"))
+    s, r = call("GET", f"/samples/{code}/versions/9999")
+    print("不存在的版本:", s, r.get("error", {}).get("code"),
+          "| 当前最新版本:", r.get("error", {}).get("details", {}).get("current_version"))
+
 
 if __name__ == "__main__":
     main()

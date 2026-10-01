@@ -105,6 +105,7 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
         return existing, True
 
     from .db import utcnow_iso
+    from .versions import CHANGE_REGISTER, record_version
 
     cur = conn.execute(
         "INSERT INTO sample (sample_code, collected_at, collector, seal_no, content_hash, created_at)"
@@ -112,6 +113,8 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
         (data.sample_code, canonical["collected_at"], data.collector, data.seal_no, h, utcnow_iso()),
     )
     row = conn.execute("SELECT * FROM sample WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 新登记样本从版本 0 开始；同号同内容重试走上面的幂等分支，不产生版本
+    record_version(conn, row, CHANGE_REGISTER)
     return row, False
 
 
@@ -204,6 +207,10 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
         raise DomainError(409, "event_conflict", f"事件号 {data.event_id} 并发写入且内容冲突")
 
     row = conn.execute("SELECT * FROM custody_event WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 真正写入一个事件 → 该样本版本递增；同号重试/冲突在上方已返回或抛错，不产生版本
+    from .versions import CHANGE_EVENT, record_version
+
+    record_version(conn, sample, CHANGE_EVENT, data.event_id)
     return row, False
 
 
@@ -554,6 +561,10 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     corr_row = conn.execute(
         "SELECT * FROM event_correction WHERE id = ?", (corr_cur.lastrowid,)
     ).fetchone()
+    # 作废/替换纠错真正生效 → 该样本版本递增；幂等重试在上方直接返回，不产生版本
+    from .versions import CHANGE_CORRECTION, record_version
+
+    record_version(conn, sample, CHANGE_CORRECTION, data.correction_id)
     return _correction_result(conn, sample, corr_row), False
 
 
@@ -562,6 +573,9 @@ def _correction_result(
 ) -> dict[str, Any]:
     """纠错提交后的响应体（含按最终有效链重算的结论、原因、当前保管人）。"""
     result = evaluate(conn, sample)
+    from .versions import latest_version_no
+
+    result["current_version"] = latest_version_no(conn, sample["id"])
     return {"correction": correction_to_dict(corr_row), "evaluation": result}
 
 
@@ -596,6 +610,13 @@ def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn)
         "UPDATE sample SET approved_storage_at = ?, approved_by = ?, approve_note = ? WHERE id = ?",
         (approved_at, data.approver, data.note, sample["id"]),
     )
+    # 入库核定真正生效（冻结点）→ 该样本版本递增；重复核定走上方幂等分支，不产生版本
+    from .versions import CHANGE_APPROVAL, record_version
+
+    record_version(conn, sample, CHANGE_APPROVAL)
+
+    sample = get_sample_or_404(conn, sample_code)
+    result = evaluate(conn, sample)
     result["approved_storage_at"] = approved_at
     result["approval"] = {"approved": True, "approved_at": approved_at, "approver": data.approver, "note": data.note}
     return result
@@ -781,6 +802,11 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
             (batch_pk, srow["id"], it.sample_code, it.transfer_no,
              it.event_id, ec.lastrowid, idx),
         )
+        # 批内每份样本的该 transfer 事件使其版本递增一次；与事件、批次明细同一事务，
+        # 任一后续插入失败整体回滚——各样本的版本与事件一同提交或一同失败。
+        from .versions import CHANGE_BATCH, record_version
+
+        record_version(conn, srow, CHANGE_BATCH, data.batch_id)
 
     return get_transfer_batch(conn, data.batch_id), False
 
@@ -806,6 +832,17 @@ def _effective_event_id(conn: sqlite3.Connection, row_id: int) -> str | None:
         if child is None:
             return None
         current_evt = child["event_id"]
+
+
+def _batch_item_summary(
+    conn: sqlite3.Connection, result: dict[str, Any], sample: sqlite3.Row
+) -> dict[str, Any]:
+    """批次明细中的逐份核验摘要（附该样本当前最新版本号）。"""
+    from .versions import latest_version_no
+
+    body = evaluation_summary(result, sample)
+    body["current_version"] = latest_version_no(conn, sample["id"])
+    return body
 
 
 def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
@@ -838,7 +875,7 @@ def get_transfer_batch(conn: sqlite3.Connection, batch_id: str) -> dict[str, Any
             "event_effective": orig["superseded_by"] is None,
             "superseded_by": orig["superseded_by"],
             "current_event_id": _effective_event_id(conn, it["event_row_id"]),
-            "evaluation": evaluation_summary(result, sample),
+            "evaluation": _batch_item_summary(conn, result, sample),
         })
 
     return {
