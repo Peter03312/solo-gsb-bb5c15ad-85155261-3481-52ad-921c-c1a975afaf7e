@@ -70,7 +70,30 @@ CREATE TABLE IF NOT EXISTS transfer_batch_item (
     item_index   INTEGER NOT NULL                       -- 提交顺序（0 起）
 );
 
+-- 样本保管链版本：登记/升级基线为版本 0，此后每次真正提交（单事件、批量移交中该份、
+-- 作废/替换纠错、入库核定）使受影响样本版本 +1；同号同内容重试与失败操作不留版本。
+-- 版本严格按提交（提交事务）先后记录；历史版本以 event_tip/correction_tip 两个行号
+-- 水位复刻当时状态——补录的事件即使发生时间更早，也只会进入新版本而不改旧版。
+CREATE TABLE IF NOT EXISTS sample_version (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id           INTEGER NOT NULL REFERENCES sample(id),
+    version             INTEGER NOT NULL,               -- 样本内版本号，0 起，按提交先后递增
+    change_type         TEXT NOT NULL CHECK (change_type IN
+                        ('register','baseline','event','batch_transfer',
+                         'correction_void','correction_replace','approval')),
+    event_tip           INTEGER NOT NULL,               -- 该版本可见 custody_event 的最大行号
+    correction_tip      INTEGER NOT NULL,               -- 该版本可见 event_correction 的最大行号
+    ref_event_id        TEXT,                            -- 触发本版本的事件号（单事件/批次事件/替换新事件/作废目标）
+    ref_batch_id        TEXT,                            -- 批量移交版本的批次号
+    ref_correction_id   TEXT,                            -- 纠错版本的纠错号（核定等其他类型为空）
+    approved_storage_at TEXT,                            -- 该版本时点的核定时间快照（未核定为 NULL）
+    approved_by         TEXT,                            -- 该版本时点的核定人快照
+    created_at          TEXT NOT NULL,                   -- 版本提交时间（版本先后以此为准，与事件发生时间无关）
+    UNIQUE (sample_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_sample_version_version ON sample_version(sample_id, version);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
@@ -139,6 +162,31 @@ def init_db() -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         for stmt in POST_MIGRATION_INDEXES:
             conn.execute(stmt)
+        _backfill_version_baseline(conn)
+
+
+def _backfill_version_baseline(conn: sqlite3.Connection) -> None:
+    """旧库升级：为尚无版本记录的样本补一条版本 0（基线=升级时状态，不推断更早历史）。
+
+    水位取升级时该样本已存在的事件/纠错最大行号：升级前历史整体折叠进版本 0。
+    新登记的样本在登记事务内自行写入版本 0（register），不在此处理。
+    """
+    conn.execute(
+        """
+        INSERT INTO sample_version
+            (sample_id, version, change_type, event_tip, correction_tip,
+             ref_event_id, ref_batch_id, ref_correction_id,
+             approved_storage_at, approved_by, created_at)
+        SELECT s.id, 0, 'baseline',
+               COALESCE((SELECT MAX(id) FROM custody_event e WHERE e.sample_id = s.id), 0),
+               COALESCE((SELECT MAX(id) FROM event_correction c WHERE c.sample_id = s.id), 0),
+               NULL, NULL, NULL,
+               s.approved_storage_at, s.approved_by, ?
+          FROM sample s
+         WHERE NOT EXISTS (SELECT 1 FROM sample_version v WHERE v.sample_id = s.id)
+        """,
+        (utcnow_iso(),),
+    )
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

@@ -15,9 +15,12 @@ from .service import (
     create_event,
     evaluate,
     evaluation_summary,
+    get_latest_version_no,
     get_sample_or_404,
+    get_sample_version_snapshot,
     get_transfer_batch,
     list_corrections,
+    list_sample_versions,
     register_sample,
     submit_correction,
     submit_transfer_batch,
@@ -43,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验与入库核定",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -114,6 +117,7 @@ def get_chain_api(sample_code: str) -> dict[str, Any]:
         result = evaluate(conn, sample)
         return {
             "sample": {k: sample[k] for k in ("sample_code", "collected_at", "collector", "seal_no")},
+            "latest_version": get_latest_version_no(conn, sample["id"]),
             "status": result["status"],
             "reasons": result["reasons"],
             "current_custodian": result["current_custodian"],
@@ -124,6 +128,43 @@ def get_chain_api(sample_code: str) -> dict[str, Any]:
             "corrections": result["corrections"],
             "superseded_events": result["superseded_events"],
         }
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions", tags=["versions"])
+def list_versions_api(sample_code: str) -> dict[str, Any]:
+    """版本清单：按提交先后列出该样本全部版本（含当前最新版本号）。"""
+    with db_session() as conn:
+        return list_sample_versions(conn, sample_code)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/versions/{{version}}", tags=["versions"])
+def get_version_api(sample_code: str, version: int) -> dict[str, Any]:
+    """指定提交版本的保管链复核：当时核验结论、原因、当前保管人、有效事件时间线、
+    纠错记录、核定信息与变更来源。
+
+    版本按提交先后编号（0 起）；未知样本 404 sample_not_found，
+    不存在的版本（含负数/超出现有版本）404 version_not_found 并回带当前最新版本号；
+    核定后的旧版仍可查询，返回的是该版本提交时点的状态。
+    """
+    if version < 0:
+        return _negative_version_response(sample_code, version)
+    with db_session() as conn:
+        return get_sample_version_snapshot(conn, sample_code, version)
+
+
+def _negative_version_response(sample_code: str, version: int) -> JSONResponse:
+    """负版本号不属于 FastAPI 路径参数校验，统一按业务错误格式返回 404。"""
+    with db_session() as conn:
+        sample = conn.execute("SELECT id FROM sample WHERE sample_code = ?", (sample_code,)).fetchone()
+        if sample is None:
+            raise DomainError(404, "sample_not_found", f"样本不存在: {sample_code}")
+        latest = get_latest_version_no(conn, sample["id"])
+        raise DomainError(
+            404,
+            "version_not_found",
+            f"样本 {sample_code} 版本 {version} 不存在（版本号从 0 开始，当前最新版本为 {latest}）",
+            {"sample_code": sample_code, "requested_version": version, "latest_version": latest},
+        )
 
 
 # --------------------------------------------------------------------------- 事件上报

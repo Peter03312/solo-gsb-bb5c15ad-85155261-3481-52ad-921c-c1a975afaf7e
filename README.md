@@ -26,6 +26,7 @@
 | 核定前纠错 | 核定前可按样本编号 + 当前有效事件号提交**作废（void）/替换（replace）**，附全局唯一纠错号、操作人、原因；替换须给完整新事件内容与**未占用**的新事件号。原事件与纠错关系永久留痕，核验仅纳入有效版本并按发生时间重算结论/原因/当前保管人；被替换记录可经链查询追溯。纠错**不得跨样本**；同纠错号同内容重试幂等（200）、异内容冲突（409）；并发针对同一有效版本仅一次成功，失败不改链。核定入库后拒绝纠错 |
 | 纠错与核定并发 | 写事务以 `BEGIN IMMEDIATE` 串行：先提交者生效，后到者看到其已提交结果——作废先提交则核定基于最终有效链（非 valid 则 422），核定先提交则纠错被 `history_locked` 拒绝 |
 | 入库核定 | 仅 `valid` 可核定；核定后该样本登记与事件全部**拒绝改写**（HTTP 409），重复核定幂等 |
+| 保管链版本 | 新登记样本从**版本 0**开始；升级前已有样本以**升级时状态作为版本 0**（不推断更早历史）。此后每次**真正提交**——单事件、批量移交中的该样本事件、作废/替换纠错、入库核定——各使受影响样本版本递增一次；**同号同内容重试与失败操作不产生版本**。版本严格按**提交先后**记录，补录事件即使发生时间更早也只进入新版本、**不改写旧版**；同一批次各样本的版本与事件在同一事务内**一同提交或一同失败**。任何旧版本（含核定后）均可按版本号复核，返回该版本提交时点的结论、原因、当前保管人、有效事件时间线、纠错记录与核定信息 |
 
 > 说明：任何事件发生时间早于样本采集时间，直接记为无效（采集前不可能发生保管动作）。
 
@@ -174,7 +175,9 @@ curl -X POST http://localhost:8080/api/v1/events -H 'Content-Type: application/j
 |---|---|
 | `GET /api/v1/samples` | 全部样本核验摘要（结论、原因、当前保管人） |
 | `GET /api/v1/samples/{sample_code}` | 单样本登记信息 + 核验摘要 |
-| `GET /api/v1/samples/{sample_code}/chain` | **完整证据链**：按发生时间排列的事件时间线、当前保管人、在途移交、结论与全部原因 |
+| `GET /api/v1/samples/{sample_code}/chain` | **当前完整证据链**：按发生时间排列的事件时间线、当前保管人、在途移交、结论与全部原因（响应带 `latest_version` 当前最新版本号） |
+| `GET /api/v1/samples/{sample_code}/versions` | **版本清单**：按提交先后列出全部版本（含 `latest_version`） |
+| `GET /api/v1/samples/{sample_code}/versions/{version}` | **指定提交版本复核**：该版本提交时点的核验结论、原因、当前保管人、有效事件时间线、纠错记录、核定信息与变更来源 |
 
 ```bash
 curl http://localhost:8080/api/v1/samples/S-001/chain
@@ -367,6 +370,92 @@ curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
 
 被作废/替换的批内原事件同样出现在对应样本 chain 的 `timeline.batch_id`（有效时）或 `superseded_events.batch_id`（失效后），可双向追溯。
 
+### 5.7 保管链版本复核（质控按提交版本回溯）
+
+每个样本的保管链按**提交版本**留痕。版本规则：
+
+- **新登记**样本登记即**版本 0**；**升级前已有**样本在首次启动新代码建表迁移时，以**升级时状态**补一条**版本 0（`baseline`）**，更早历史折叠进基线、不做推断；
+- 此后每一次**真正提交**使**受影响样本**版本 `+1`：单事件（`event`）、批量移交中的该样本事件（`batch_transfer`）、作废纠错（`correction_void`）、替换纠错（`correction_replace`）、入库核定（`approval`）；
+- **同号同内容重试**（事件/纠错/批次/核定幂等）与**失败操作**（冲突、校验失败、整批失败）**不产生版本**；
+- 版本严格按**提交先后**编号；补录的事件即使 `occurred_at` 早于既有事件，也只进入新版本，**旧版本快照永不改写**（旧版按提交时的行号水位复刻，而非按当前表状态）；
+- 同一批次内各样本的版本与事件、批次头在**同一事务**中一同提交，整批失败时一同回滚、不留版本。
+
+#### 版本清单
+
+`GET /api/v1/samples/{sample_code}/versions`
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/versions
+```
+
+```json
+{
+  "sample_code": "S-001",
+  "latest_version": 6,
+  "total": 7,
+  "items": [
+    {"version": 0, "change": {"type": "register", "label": "登记（版本0）",
+     "event_id": null, "batch_id": null, "correction_id": null,
+     "committed_at": "2026-09-30T01:05:00Z"},
+     "status": "pending", "current_custodian": "王采集",
+     "approved": false, "approved_storage_at": null},
+    {"version": 1, "change": {"type": "event", "label": "单事件提交",
+     "event_id": "EVT-T1", "batch_id": null, "correction_id": null,
+     "committed_at": "2026-09-30T02:05:00Z"},
+     "status": "pending", "current_custodian": "王采集",
+     "approved": false, "approved_storage_at": null}
+  ]
+}
+```
+
+#### 指定版本快照（复核入口）
+
+`GET /api/v1/samples/{sample_code}/versions/{version}`
+
+```bash
+curl http://localhost:8080/api/v1/samples/S-001/versions/3
+```
+
+返回该版本**提交时点**的保管链（结构与当前链查询一致，另带版本元数据）：
+
+```json
+{
+  "sample": {"sample_code": "S-001", "collected_at": "...", "collector": "王采集", "seal_no": "SEAL-001"},
+  "version": 3,
+  "latest_version": 6,
+  "change": {"type": "correction_replace", "label": "替换纠错",
+             "event_id": "EVT-C2", "batch_id": null, "correction_id": "FIX-0002",
+             "committed_at": "2026-09-30T05:10:00Z"},
+  "committed_at": "2026-09-30T05:10:00Z",
+  "status": "valid",
+  "reasons": ["保管链完整：采集 王采集 至当前保管人 实验室，封签一致，已入库"],
+  "current_custodian": "实验室",
+  "pending_transfer": null,
+  "has_storage": true,
+  "timeline": [
+    {"event_id": "EVT-T1", "event_type": "transfer", "occurred_at": "...", "recorded_at": "...",
+     "payload": {"...": "..."}, "replaces_event_id": null, "batch_id": null}
+  ],
+  "corrections": [
+    {"correction_id": "FIX-0002", "target_event_id": "EVT-C1", "action": "replace",
+     "operator": "质控员", "reason": "……", "new_event_id": "EVT-C2", "created_at": "..."}
+  ],
+  "superseded_events": [
+    {"event_id": "EVT-C1", "event_type": "seal_check", "occurred_at": "...",
+     "payload": {"...": "..."}, "superseded_by": "FIX-0002",
+     "replaces_event_id": null, "batch_id": null}
+  ],
+  "approval": {"approved": false, "approved_at": null, "approver": null, "note": null}
+}
+```
+
+要点：
+
+- `timeline` 是该版本时点的**有效事件**（按 `occurred_at` 排列；替换产生的事件带 `replaces_event_id`，批量事件带 `batch_id`）；`superseded_events` / `corrections` 为该版本时点已存在的失效事件与纠错留痕；
+- `approval` 是该版本时点的**核定信息快照**（核定前的版本 `approved=false`，核定版本及其后版本带核定时间/操作人/备注）；
+- 核定入库只冻结写入，**不影响任何旧版本查询**；旧版本永远按当时状态返回；
+- 未知样本 → `404 sample_not_found`；版本不存在（含负数、超出现有版本号）→ `404 version_not_found`，响应体 `details` 回带 `latest_version`；版本号非整数 → `422`。
+
 ### 错误响应统一格式
 
 ```json
@@ -376,6 +465,7 @@ curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
 | HTTP | code | 触发 |
 |---|---|---|
 | 404 | `sample_not_found` / `event_not_found` | 样本不存在 / 纠错目标事件不存在 |
+| 404 | `version_not_found` | 指定版本不存在（负数或超出现有版本号；`details` 回带 `latest_version`） |
 | 409 | `sample_conflict` / `event_conflict` | 同编号异内容 / 同事件号异内容 |
 | 409 | `history_locked` | 已核定入库后改写历史或纠错 |
 | 409 | `correction_conflict` | 同纠错号异内容（含动作 void↔replace 不一致） |
@@ -397,7 +487,7 @@ curl http://localhost:8080/api/v1/transfer-batches/BATCH-20260930-01
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **保管链版本复核（版本清单、指定版本快照、不存在版本/未知样本报错）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
 
 ---
 
@@ -407,11 +497,13 @@ python examples/call_api.py
 python -m tests.test_chain          # 既有规则：42 项断言
 python -m tests.test_corrections    # 纠错：65 项断言（含并发）
 python -m tests.test_batches        # 本轮批量移交：83 项断言（含并发）
+python -m tests.test_versions       # 版本复核：73 项断言（含旧库升级基线）
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
 - `test_corrections` 覆盖：作废后仅有效版本重算（结论/原因/保管人）、替换生效与多跳替换、原事件与纠错关系留痕及链追溯、审计查询、同纠错号幂等/异内容冲突、跨样本拒绝、非有效版本拒绝、新事件号占用、replace/void 载荷校验、核定后拒绝纠错、同事件号 200/409 兼容、同有效版本并发仅一次成功、纠错与核定并发两种合法结局（可重复运行）。
 - `test_batches` 覆盖：整批提交各份成为既有 transfer（逐份 pending/invalid 与在途信息、时间线批次归属）、整批失败四类原因（批内样本/事件号重复、样本不存在、已核定、事件号占用）且不留批次/事件/明细、冲突聚合与 409/422 优先、同批次号幂等（items 换序、时区归一、核定后仍 200）与异内容 409、批次查询随作废/替换更新（`event_effective`/`current_event_id`）与原始归属留痕、单事件接口对批量事件号 200/409、同批并发一建一幂等、异批事件号交叠一胜整批回滚、批次与核定并发按已提交顺序判定两种结局、载荷校验与失败批次号复用。
+- `test_versions` 覆盖：登记即版本 0 与逐事件递增、指定版本快照复刻当时结论/原因/保管人/有效时间线、幂等重试与失败（冲突/校验失败）不产生版本、补录早发生时间事件只进新版本不改旧版、作废/替换各递增且旧版保留当时有效集与留痕、替换失败不产生版本、核定产生 approval 版本且核定信息按版本快照、重复核定/核定后改写与纠错不产生版本、核定后旧版仍可查、批量移交批内各样本各递增一次且整批失败不留版本、批内作废后旧版不变、未知样本/超出版本/负版本/非整数版本报错、旧库升级基线（baseline 复刻升级时状态、升级后提交从 v1 起）。
 
 ---
 
@@ -421,15 +513,16 @@ python -m tests.test_batches        # 本轮批量移交：83 项断言（含并
 .
 ├── app/
 │   ├── main.py       # FastAPI 路由、异常映射、启动初始化
-│   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结、批量移交
+│   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结、批量移交、版本快照
 │   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）按类型必填校验
-│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表）、IMMEDIATE 事务
+│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表、版本表 sample_version 及升级基线回填）、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等）
 │   └── config.py     # 环境变量配置
-├── examples/call_api.py   # 零依赖调用示例（含纠错与批量移交全流程）
+├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、版本复核全流程）
 ├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
 ├── tests/test_corrections.py  # 纠错端到端自测（65 项断言，含并发）
 ├── tests/test_batches.py  # 批量移交端到端自测（83 项断言，含并发）
+├── tests/test_versions.py # 保管链版本复核端到端自测（73 项断言，含旧库升级基线）
 ├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml

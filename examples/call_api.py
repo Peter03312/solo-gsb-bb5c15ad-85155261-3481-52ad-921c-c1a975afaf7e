@@ -282,6 +282,43 @@ def main() -> None:
         print(f"    {it['sample_code']}: 原事件 {it['event_id']} 有效={it['event_effective']}"
               f" 当前有效事件={it['current_event_id']} 结论={it['evaluation']['status']}")
 
+    # 13) 保管链版本复核（质控按 样本编号 + 版本号 查询指定提交版本）
+    print("\n================ 保管链版本复核 ================")
+    # 13.1) 版本清单：登记=版本0，此后每次真正提交（事件/批量/纠错/核定）+1；
+    #       同号同内容重试与失败操作不产生版本
+    s, r = call("GET", f"/samples/{code}/versions")
+    print(f"\n--- 版本清单 [HTTP {s}] 最新版本={r.get('latest_version')} 共 {r.get('total')} 版 ---")
+    for it in r.get("items", []):
+        ch = it["change"]
+        ref = ch.get("event_id") or ch.get("batch_id") or ch.get("correction_id") or "-"
+        print(f"    v{it['version']:<2} {ch['label']:<14} ref={ref:<28}"
+              f" 结论={it['status']:<8} 保管人={it['current_custodian']} 提交于 {it['committed_at']}")
+
+    # 13.2) 指定版本快照：当时的核验结论/原因/当前保管人/有效事件时间线/纠错/核定信息
+    latest = r["latest_version"]
+    for v in (0, 1, latest):
+        s, sv = call("GET", f"/samples/{code}/versions/{v}")
+        print(f"\n--- 样本 {code} 版本 v{v} 快照 [HTTP {s}]"
+              f"（当前最新 v{sv.get('latest_version')}）---")
+        print("  变更来源:", sv["change"]["label"], "| 提交时间:", sv["committed_at"])
+        print("  核验结论:", sv["status"], "| 当前保管人:", sv["current_custodian"])
+        print("  原因:", sv["reasons"][0] if sv["reasons"] else "")
+        print("  有效时间线:", [(e["event_id"], e["event_type"]) for e in sv["timeline"]])
+        if sv["corrections"]:
+            print("  纠错记录:", [(c["correction_id"], c["action"], c["new_event_id"])
+                                for c in sv["corrections"]])
+        if sv["superseded_events"]:
+            print("  已失效事件（留痕）:", [e["event_id"] for e in sv["superseded_events"]])
+        print("  核定信息:", sv["approval"])
+
+    # 13.3) 不存在的版本 / 未知样本：明确 404，响应体回带当前最新版本号
+    s, r = call("GET", f"/samples/{code}/versions/{latest + 100}")
+    print(f"\n--- 查询不存在的版本 [HTTP {s}] ---")
+    print(" ", r.get("error", {}).get("code"), "|", r.get("error", {}).get("message"))
+    s, r = call("GET", "/samples/NO-SUCH-SAMPLE/versions/0")
+    print(f"--- 查询未知样本 [HTTP {s}] ---")
+    print(" ", r.get("error", {}).get("code"), "|", r.get("error", {}).get("message"))
+
 
 if __name__ == "__main__":
     main()

@@ -24,6 +24,9 @@ LAB_CUSTODIAN = "实验室"
 
 EVENT_TYPES = ("transfer", "receive", "seal_check", "storage")
 
+# 可选参数“未提供”哨兵（区别于显式传入 None）
+_UNSET = object()
+
 
 class DomainError(Exception):
     def __init__(self, status_code: int, code: str, message: str, details: dict[str, Any] | None = None):
@@ -82,6 +85,188 @@ def evaluation_summary(result: dict[str, Any], sample: sqlite3.Row | dict[str, A
     }
 
 
+# --------------------------------------------------------------------------- 保管链版本
+
+# 版本变更类型 → 中文说明（版本清单/快照的 change 字段）
+CHANGE_LABELS: dict[str, str] = {
+    "register": "登记（版本0）",
+    "baseline": "升级基线（版本0）",
+    "event": "单事件提交",
+    "batch_transfer": "批量移交中的该样本事件",
+    "correction_void": "作废纠错",
+    "correction_replace": "替换纠错",
+    "approval": "入库核定",
+}
+
+
+def _row_tips(conn: sqlite3.Connection, sample_id: int) -> tuple[int, int]:
+    """该样本当前 custody_event / event_correction 的最大行号（版本水位）。"""
+    erow = conn.execute(
+        "SELECT COALESCE(MAX(id),0) FROM custody_event WHERE sample_id = ?", (sample_id,)
+    ).fetchone()[0]
+    crow = conn.execute(
+        "SELECT COALESCE(MAX(id),0) FROM event_correction WHERE sample_id = ?", (sample_id,)
+    ).fetchone()[0]
+    return int(erow), int(crow)
+
+
+def insert_sample_version(
+    conn: sqlite3.Connection,
+    sample: sqlite3.Row | dict[str, Any],
+    change_type: str,
+    *,
+    ref_event_id: str | None = None,
+    ref_batch_id: str | None = None,
+    ref_correction_id: str | None = None,
+    created_at: str | None = None,
+    approved_storage_at: Any = _UNSET,
+    approved_by: Any = _UNSET,
+) -> None:
+    """在写事务内追加一个样本版本。版本号 = 该样本已有最大版本 +1（0 起）。
+
+    必须与产生变更的写入处于同一事务：整批各样本的版本随批次一起提交或一起回滚；
+    重试（幂等）与失败路径不得调用本函数，故不产生版本。
+    """
+    from .db import utcnow_iso
+
+    sample_id = sample["id"]
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(version), -1) FROM sample_version WHERE sample_id = ?", (sample_id,)
+    ).fetchone()[0]
+    event_tip, correction_tip = _row_tips(conn, sample_id)
+    conn.execute(
+        "INSERT INTO sample_version"
+        " (sample_id, version, change_type, event_tip, correction_tip,"
+        "  ref_event_id, ref_batch_id, ref_correction_id,"
+        "  approved_storage_at, approved_by, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            sample_id,
+            int(latest) + 1,
+            change_type,
+            event_tip,
+            correction_tip,
+            ref_event_id,
+            ref_batch_id,
+            ref_correction_id,
+            sample["approved_storage_at"] if approved_storage_at is _UNSET else approved_storage_at,
+            sample["approved_by"] if approved_by is _UNSET else approved_by,
+            created_at or utcnow_iso(),
+        ),
+    )
+
+
+def get_latest_version_no(conn: sqlite3.Connection, sample_id: int) -> int:
+    row = conn.execute(
+        "SELECT MAX(version) FROM sample_version WHERE sample_id = ?", (sample_id,)
+    ).fetchone()[0]
+    return int(row)  # 任何现存样本至少有版本 0
+
+
+def _change_dict(vrow: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "type": vrow["change_type"],
+        "label": CHANGE_LABELS.get(vrow["change_type"], vrow["change_type"]),
+        "event_id": vrow["ref_event_id"],
+        "batch_id": vrow["ref_batch_id"],
+        "correction_id": vrow["ref_correction_id"],
+        "committed_at": vrow["created_at"],
+    }
+
+
+def _evaluate_version(conn: sqlite3.Connection, sample: sqlite3.Row, vrow: sqlite3.Row) -> dict[str, Any]:
+    """按版本水位复刻该版本提交时点的有效事件/纠错集并重算。"""
+    event_rows = conn.execute(
+        "SELECT * FROM custody_event WHERE sample_id = ? AND id <= ? ORDER BY occurred_at ASC, id ASC",
+        (sample["id"], vrow["event_tip"]),
+    ).fetchall()
+    corr_rows = conn.execute(
+        "SELECT * FROM event_correction WHERE sample_id = ? AND id <= ? ORDER BY id ASC",
+        (sample["id"], vrow["correction_tip"]),
+    ).fetchall()
+    return _evaluate_state(
+        dict(sample),
+        event_rows,
+        corr_rows,
+        approved_storage_at=vrow["approved_storage_at"],
+    )
+
+
+def get_sample_version_snapshot(
+    conn: sqlite3.Connection, sample_code: str, version: int
+) -> dict[str, Any]:
+    """指定提交版本的保管链复核快照：当时核验结论/原因/当前保管人/有效时间线/纠错/核定。"""
+    sample = get_sample_or_404(conn, sample_code)
+    vrow = conn.execute(
+        "SELECT * FROM sample_version WHERE sample_id = ? AND version = ?",
+        (sample["id"], version),
+    ).fetchone()
+    if vrow is None:
+        latest = get_latest_version_no(conn, sample["id"])
+        raise DomainError(
+            404,
+            "version_not_found",
+            f"样本 {sample_code} 版本 {version} 不存在（当前最新版本为 {latest}）",
+            {"sample_code": sample_code, "requested_version": version, "latest_version": latest},
+        )
+
+    result = _evaluate_version(conn, sample, vrow)
+    # 核定备注不随链重算变化，随首个核定版本快照；此处从样本行取核定备注用于展示
+    approve_note = sample["approve_note"] if vrow["approved_storage_at"] else None
+    return {
+        "sample": {
+            "sample_code": sample["sample_code"],
+            "collected_at": sample["collected_at"],
+            "collector": sample["collector"],
+            "seal_no": sample["seal_no"],
+        },
+        "version": version,
+        "latest_version": get_latest_version_no(conn, sample["id"]),
+        "change": _change_dict(vrow),
+        "committed_at": vrow["created_at"],
+        "status": result["status"],
+        "reasons": result["reasons"],
+        "current_custodian": result["current_custodian"],
+        "pending_transfer": result["pending_transfer"],
+        "has_storage": result["has_storage"],
+        "timeline": result["timeline"],
+        "corrections": result["corrections"],
+        "superseded_events": result["superseded_events"],
+        "approval": {
+            "approved": vrow["approved_storage_at"] is not None,
+            "approved_at": vrow["approved_storage_at"],
+            "approver": vrow["approved_by"],
+            "note": approve_note,
+        },
+    }
+
+
+def list_sample_versions(conn: sqlite3.Connection, sample_code: str) -> dict[str, Any]:
+    """版本清单：按版本号（提交先后）给出每次变更类型、引用对象与当时结论。"""
+    sample = get_sample_or_404(conn, sample_code)
+    vrows = conn.execute(
+        "SELECT * FROM sample_version WHERE sample_id = ? ORDER BY version ASC", (sample["id"],)
+    ).fetchall()
+    items: list[dict[str, Any]] = []
+    for v in vrows:
+        result = _evaluate_version(conn, sample, v)
+        items.append({
+            "version": v["version"],
+            "change": _change_dict(v),
+            "committed_at": v["created_at"],
+            "status": result["status"],
+            "current_custodian": result["current_custodian"],
+            "approved": v["approved_storage_at"] is not None,
+            "approved_storage_at": v["approved_storage_at"],
+        })
+    return {
+        "sample_code": sample_code,
+        "latest_version": items[-1]["version"] if items else 0,
+        "total": len(items),
+        "items": items,
+    }
+
+
 # --------------------------------------------------------------------------- 样本登记
 
 def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.Row, bool]:
@@ -106,12 +291,15 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
 
     from .db import utcnow_iso
 
+    created_at = utcnow_iso()
     cur = conn.execute(
         "INSERT INTO sample (sample_code, collected_at, collector, seal_no, content_hash, created_at)"
         " VALUES (?,?,?,?,?,?)",
-        (data.sample_code, canonical["collected_at"], data.collector, data.seal_no, h, utcnow_iso()),
+        (data.sample_code, canonical["collected_at"], data.collector, data.seal_no, h, created_at),
     )
     row = conn.execute("SELECT * FROM sample WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 新登记样本从版本 0 开始
+    insert_sample_version(conn, row, "register", created_at=created_at)
     return row, False
 
 
@@ -204,6 +392,8 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
         raise DomainError(409, "event_conflict", f"事件号 {data.event_id} 并发写入且内容冲突")
 
     row = conn.execute("SELECT * FROM custody_event WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 真正提交的单事件：受影响样本版本 +1（幂等重试与失败路径不走此处，不产生版本）
+    insert_sample_version(conn, sample, "event", ref_event_id=data.event_id)
     return row, False
 
 
@@ -230,7 +420,7 @@ def correction_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
-    """按发生时间重算该样本的完整证据链，输出结论。
+    """按发生时间重算该样本当前的完整证据链，输出结论。
 
     仅纳入当前有效版本（superseded_by IS NULL）；被作废/替换的事件不参与核验，
     其内容经 superseded_events 与 corrections 永久留痕、可追溯。
@@ -239,8 +429,30 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
         "SELECT * FROM custody_event WHERE sample_id = ? ORDER BY occurred_at ASC, id ASC",
         (sample["id"],),
     ).fetchall()
-    events = [e for e in all_rows if e["superseded_by"] is None]
-    superseded_rows = [e for e in all_rows if e["superseded_by"] is not None]
+    correction_rows = _correction_rows(conn, sample["id"])
+    return _evaluate_state(dict(sample), all_rows, correction_rows)
+
+
+def _evaluate_state(
+    sample: dict[str, Any],
+    all_rows: list[sqlite3.Row],
+    correction_rows: list[sqlite3.Row],
+    approved_storage_at: Any = _UNSET,
+) -> dict[str, Any]:
+    """给定某一时点的事件全集与纠错全集，按发生时间重算保管链结论。
+
+    版本历史查询复用本函数：
+      * all_rows 只传入该版本水位（行号）以内已提交的事件——故补录但发生时间更早的
+        事件不会出现在更早版本中；
+      * 事件是否有效由 correction_rows 推导（superseded_by 是现状列，历史时点可能尚未作废）；
+      * approved_storage_at 传入 None 表示未核定；省略（...）表示沿用 sample 行上的现值。
+    """
+    # 该时点每条纠错使 target_event_id 失效（同一有效版本并发只允许一次纠错，目标不冲突）
+    superseded_ids = {r["target_event_id"]: r["correction_id"] for r in correction_rows}
+    events = [e for e in all_rows if e["event_id"] not in superseded_ids]
+    superseded_rows = [e for e in all_rows if e["event_id"] in superseded_ids]
+    if approved_storage_at is _UNSET:
+        approved_storage_at = sample["approved_storage_at"]
 
     current = sample["collector"]                       # 当前保管人（初始为采集人）
     open_transfer: dict[str, Any] | None = None         # 在途移交（已移交未签收）
@@ -390,13 +602,13 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
             "occurred_at": ev["occurred_at"],
             "recorded_at": ev["created_at"],
             "payload": json.loads(ev["payload_json"]),
-            "superseded_by": ev["superseded_by"],
+            "superseded_by": superseded_ids[ev["event_id"]],
             "replaces_event_id": ev["replaces_event_id"],
             "batch_id": ev["batch_id"],
         }
         for ev in superseded_rows
     ]
-    corrections = [correction_to_dict(r) for r in _correction_rows(conn, sample["id"])]
+    corrections = [correction_to_dict(r) for r in correction_rows]
 
     return {
         "sample_code": sample["sample_code"],
@@ -405,7 +617,7 @@ def evaluate(conn: sqlite3.Connection, sample: sqlite3.Row) -> dict[str, Any]:
         "current_custodian": current,
         "pending_transfer": open_transfer,
         "has_storage": stored,
-        "approved_storage_at": sample["approved_storage_at"],
+        "approved_storage_at": approved_storage_at,
         "event_count": len(events),
         "timeline": timeline,
         "corrections": corrections,
@@ -554,6 +766,14 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     corr_row = conn.execute(
         "SELECT * FROM event_correction WHERE id = ?", (corr_cur.lastrowid,)
     ).fetchone()
+    # 作废 / 替换纠错各使受影响样本版本 +1
+    insert_sample_version(
+        conn,
+        sample,
+        "correction_replace" if data.action == "replace" else "correction_void",
+        ref_event_id=(data.new_event.event_id if data.new_event else data.target_event_id),
+        ref_correction_id=data.correction_id,
+    )
     return _correction_result(conn, sample, corr_row), False
 
 
@@ -595,6 +815,14 @@ def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn)
     conn.execute(
         "UPDATE sample SET approved_storage_at = ?, approved_by = ?, approve_note = ? WHERE id = ?",
         (approved_at, data.approver, data.note, sample["id"]),
+    )
+    # 入库核定使受影响样本版本 +1（重复核定走幂等提前返回，不产生版本）
+    insert_sample_version(
+        conn,
+        sample,
+        "approval",
+        approved_storage_at=approved_at,
+        approved_by=data.approver,
     )
     result["approved_storage_at"] = approved_at
     result["approval"] = {"approved": True, "approved_at": approved_at, "approver": data.approver, "note": data.note}
@@ -780,6 +1008,17 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
             " VALUES (?,?,?,?,?,?,?)",
             (batch_pk, srow["id"], it.sample_code, it.transfer_no,
              it.event_id, ec.lastrowid, idx),
+        )
+
+    # 4) 批内每份样本各递增一次版本；与批次、事件同事务，整批一起提交或一起失败
+    for idx, it in enumerate(data.items):
+        insert_sample_version(
+            conn,
+            sample_rows[it.sample_code],
+            "batch_transfer",
+            ref_event_id=it.event_id,
+            ref_batch_id=data.batch_id,
+            created_at=created_at,
         )
 
     return get_transfer_batch(conn, data.batch_id), False
